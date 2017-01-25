@@ -100,6 +100,12 @@ After grid search experiments I finished with next results:
 * more pixpercell produced more accuracy; best results I got with 16
 * cells per block value of 2 gives best results
 
+Resulting accuraci for GradientBoostingClassifier:
+* train set -- 0.985168630638
+* test set -- 0.968309859155
+
+Of course, there is a lot of space for tuning classifier parameters, but this accuracy is good enough.
+
 Below is an example of images with chosen HOG parameters (`HOG_ORIENT = 10`, `HOG_PPC = 16`, `HOG_CPB = 2`)
 ![Vehicles](readme_files/hog-vehicle.png)
 ![Non-vehicles](readme_files/hog-nonvehicle.png)
@@ -110,3 +116,141 @@ Key points:
 * HOG parameters such color space, orientation, and others were choosen by grid search to get highest classification results
 * GradientBoostingClassifier was choosen in same way
 * [`sklearn.preprocessing.StandardScaler`](http://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.StandardScaler.html) used to normalize data
+
+## Sliding window implementation
+
+For sliding window approach I defined that objects in right and left part of the image need more rectangle-based windows to correctly identify the car.
+For this, I used square basic sizes for windows, but also non-linear approach to handle this perspective transformations.
+The common idea looks so:
+* take initial window size, e.g. 96 pixels
+* define center position of the window based on initial window size and overlap factor
+* use height same as window size, e.g. 96 pixels
+* calculate width with next formula:
+  + $Size_{new} = Size_{default} * (1 + (\frac{center_{window} - center_{image}}{0.5 * Size_{image}})^2)$
+  + i.e. if window is far left/right from center, use more rectangled window, because of perspective
+  
+I also defined that it is redundant to take windows from very bottom of the image, better to use some offsets.
+With some manual checks on test frames I finished with 4 rows of windows with overlapping factor of `0.05`:
+
+| Bottom offset | Initial width/height |
+| --- | --- |
+| 96 | 256 |
+| 150 | 196 |
+| 200 | 128 |
+| 230 | 96|
+
+Code snippet for sliding windows:
+```
+def get_sliding_windows(img):
+    windows = []
+    images = []
+    
+    # For every defined sliding window
+    for bottom_offset, window_size in SLW_WINDOWS:
+        # Define step and total number of windows
+        step = int(window_size * SLW_OVERLAP)
+        total_windows = IMG_WIDTH // step + 1
+        
+        # For every single window
+        for i in range(total_windows):
+            # Define center and window width
+            center = i * step
+            deviation = float(center - IMG_CENTER) / IMG_CENTER
+            window_width = int((window_size / 2) * (1. + deviation ** 2))
+            
+            # Calculate left and right X positions
+            if center - window_width < 0:
+                xleft = 0
+                xrigh = center + window_width
+            elif center + window_width > IMG_WIDTH:
+                xleft = center - window_width
+                xrigh = IMG_WIDTH
+            else:
+                xleft = center - window_width
+                xrigh = center + window_width
+                
+            # Calculate Y positions
+            yleft = IMG_HEIGTH - bottom_offset
+            yrigh = yleft - window_size
+            
+            # Remember box coordinates and image patch
+            windows.append([(xleft, yleft), (xrigh, yrigh)])
+            images.append(img[yrigh:yleft, xleft:xrigh, :])
+            
+    return windows, images
+```
+
+Here is how sliding windows over a test image look like:
+![Sliding windows](readme_files/sliding-window.png)
+
+Okay, we have many image patches (images) and their positions (windows).
+Because these images have different sizes according to window sizes, they are resized to 64x64 as initial classifier.
+```
+def prepare_image_patch_for_classifier(img):
+    if img.shape[0] != 64 or img.shape[1] != 64:
+        img = cv2.resize(img, (64, 64))
+    img = np.expand_dims(img, axis=0)
+        
+    return img
+```
+
+Next step is to create a heatmap of positive detections:
+```
+def get_vehicles_heatmap_from_image(source_image, probability=.85):
+    # Get all sliding windows and image patches
+    windows, images = get_sliding_windows(source_image)
+    
+    # Define heatmap as zeros image
+    heatmap = np.zeros((source_image.shape[0], source_image.shape[1]), dtype=np.uint8)
+    
+    i = 0
+    for i in range(len(windows)):
+        wnd, img = windows[i], images[i]
+        
+        # Preprocess image patch
+        img = prepare_image_patch_for_classifier(img)
+        img = preprocess_input(img)
+        
+        # Classify, but take not 0 or 1 class prediction, but raw probability
+        clfproba = clf.predict_proba(img)[0]
+        
+        # Only if probability is high enouth, consider patch as vehicle and update heatmap
+        if clfproba[1] > probability:
+            xleft, yleft = wnd[0]
+            xrigh, yrigh = wnd[1]
+            heatmap[yrigh:yleft, xleft:xrigh] += 1
+
+    return heatmap
+```
+
+Initially heatmap is just zero-filled integer matrix with image shape.
+For every positive detection corresponding pixels values on the heatmap increase by 1.
+One of the most challenging parts in this project is how to get boundary boxes from this heatmap.
+I merge overlapped windows into one by using [`skimage.measure.label`](http://scikit-image.org/docs/dev/api/skimage.measure.html#skimage.measure.label) and [`skimage.measure.regionprops`](http://scikit-image.org/docs/dev/api/skimage.measure.html#skimage.measure.regionprops) functions.
+I make a binary mask for the heatmap -- pixels with intensity more than 1 will be counted for boundary building.
+This manual simple treshold was tested together with otsu treshold 
+
+```
+def get_boundaries_from_heatmap(heatmap):
+    # If heatmap is empty, return empty boundaries
+    if(heatmap.max() == 0):
+        return []
+    
+    # Consider only heatmap valies greater than 1
+    thresh = 1
+    mask = np.zeros_like(heatmap)
+    mask[heatmap > thresh] = 1
+    
+    # Use skimage.measure.label to label regions on the mask
+    labeled = label(mask)
+    boxes = []
+    
+    # Use skimage.measure.regionprops to get regois our of labelled image. Keep only images with big area
+    for region in regionprops(labeled):
+        if region.area < 5000:
+            continue
+        
+        minr, minc, maxr, maxc = region.bbox
+        boxes.append(((minc, minr), (maxc, maxr)))
+    return boxes
+```
