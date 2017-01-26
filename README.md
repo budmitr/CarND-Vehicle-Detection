@@ -226,9 +226,10 @@ def get_vehicles_heatmap_from_image(source_image, probability=.85):
 Initially heatmap is just zero-filled integer matrix with image shape.
 For every positive detection corresponding pixels values on the heatmap increase by 1.
 One of the most challenging parts in this project is how to get boundary boxes from this heatmap.
-I merge overlapped windows into one by using [`skimage.measure.label`](http://scikit-image.org/docs/dev/api/skimage.measure.html#skimage.measure.label) and [`skimage.measure.regionprops`](http://scikit-image.org/docs/dev/api/skimage.measure.html#skimage.measure.regionprops) functions.
-I make a binary mask for the heatmap -- pixels with intensity more than 1 will be counted for boundary building.
-This manual simple treshold was tested together with otsu treshold 
+To solve this, I first make a binary mask for the heatmap -- pixels with intensity more than 1 will be counted for boundary building.
+This manual simple treshold of 1 was tested together with otsu treshold [`skimage.filters.threshold_otsu`](http://scikit-image.org/docs/dev/api/skimage.filters.html?highlight=skimage%20filters#skimage.filters.threshold_otsu) and actually performed better than otsu.
+Then merge overlapped windows into one by using [`skimage.measure.label`](http://scikit-image.org/docs/dev/api/skimage.measure.html#skimage.measure.label) and [`skimage.measure.regionprops`](http://scikit-image.org/docs/dev/api/skimage.measure.html#skimage.measure.regionprops) functions.
+Detected regions with area less than 5000 pixels are discarded, this allows to reduce many false positives already.
 
 ```
 def get_boundaries_from_heatmap(heatmap):
@@ -254,3 +255,82 @@ def get_boundaries_from_heatmap(heatmap):
         boxes.append(((minc, minr), (maxc, maxr)))
     return boxes
 ```
+
+## Video processing
+
+To get rid of false positives on the video I keep tracking centroid of detected boxes. On every frame the logic is next:
+* get boxes with sliding window;
+* for every found box calculate centroid;
+* use centroid trackers to define if current centroid belongs to already tracked vehicle;
+* if no tracker matched this centroid, create new tracker;
+* draw box only if tracker has several successful centroids -- this is the most important part of getting rid of false; positives. Tracked vehicles will pass this condition successfully and draw boxes, but false positive trackers will fail and die soon.
+
+As noted, if tracker has no new detections for several steps (DEATH_TOLERANCE), it will be considered as dead and removed.
+Thus, only correct vehicle tracking trackers will survive and draw boxes from frame to frame.
+
+Code for this is structured into 3 classes: `Centroid`, `CentroidTracker` and `ImageProcessor`.
+Below is code snippet ot `ImageProcessor.process_frame` function which gives overall understanding of how described steps are implemented in code.
+
+```
+# Main frame processing function
+def process_frame(self):
+    # First, get boxes from current image
+    heatmap = get_vehicles_heatmap_from_image(self.current_frame)
+    boxes = get_boundaries_from_heatmap(heatmap)
+
+    # reset tracker states before frame processing
+    self.pre_frame_action()
+
+    # check every found box
+    for box in boxes:
+        # get centroid
+        c = Centroid()
+        c.init_from_box(box)
+
+        # by default, centroid is considered as a trash
+        frame_box = None
+        is_assigned = False
+        is_drawable = False
+
+        # try current centroid for every tracker to see which one it can match
+        for tracker in self.trackers:
+            # if matches, append to that tracker and check if it is drawable
+            if tracker.check_new_centroid(c):
+                tracker.append_centroid(c)
+
+                frame_box = box
+                if (tracker.last_box):
+                    frame_box = self.get_averaged_box(tracker.last_box, frame_box)
+                tracker.set_last_box(frame_box)
+
+                is_assigned = True
+                is_drawable = tracker.is_last_centroid_drawable()
+                break
+
+        # not matched to any tracker -- maybe a new car appeared on the road?
+        if not is_assigned:
+            newtracker = CentroidTracker(c)
+            self.trackers.append(newtracker)
+
+        if is_drawable:
+            self.draw_box_on_frame(frame_box)
+
+    # If no boxes found, check if any tracker is good enough to be restored
+    if not len(boxes):
+        for t in self.trackers:
+            if t.is_restorable():
+                self.draw_box_on_frame(t.last_box)
+
+    self.post_frame_action()
+    return self.current_frame
+```
+
+Some noteworthy points here -- even if centroid is considered to match a tracker, its box may still be discarded from being drawn.
+The condition to being drawable is to have previously defined centroids.
+This is the most important part of eliminating false positives.
+Because of some frames have no detections, I allow restoring prevous boxes if tracker is stable enough, i.e. has lot of good detections in last frames.
+Another interesting point is for drawable box I use weighted sum of previous box and current one, this makes boxes in video much smoother.
+
+Here is a resulting project video generated by described pipeline.
+
+[![Screenshot](https://img.youtube.com/vi/_nWmVioHDW4/0.jpg)](https://www.youtube.com/watch?v=_nWmVioHDW4)
