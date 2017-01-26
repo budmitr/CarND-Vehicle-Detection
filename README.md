@@ -256,6 +256,10 @@ def get_boundaries_from_heatmap(heatmap):
     return boxes
 ```
 
+Image below demonstrates raw image, its resulting heatmap and boundary boxes.
+Note that there is a false positive detection but it is discarded by treshold.
+![Sliding windows](readme_files/detection.png)
+
 ## Video processing
 
 To get rid of false positives on the video I keep tracking centroid of detected boxes. On every frame the logic is next:
